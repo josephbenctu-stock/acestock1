@@ -1750,17 +1750,26 @@ def evaluate_stock(
 
 
 def plot_stock(result: Dict, show_volume: bool = True):
-    df = result["_df"].tail(150)
-    tri: TriangleResult = result["_tri"]
+    df = result.get("_df", pd.DataFrame())
+    if df is None or df.empty or not all(c in df.columns for c in ["Open", "High", "Low", "Close"]):
+        fig = go.Figure()
+        fig.add_annotation(text="此列為除錯資料：目前沒有足夠 K 線可畫圖", x=0.5, y=0.5, showarrow=False)
+        fig.update_layout(height=320, title=f"{result.get('代號','')} {result.get('名稱','')}｜除錯資料")
+        return fig
+    df = df.tail(150)
+    tri: TriangleResult = result.get("_tri", TriangleResult(False, "未形成有效三角", 0, None, None, None, None, None, None, None, None, 0, 0, "-", [], [], []))
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
         name="K線"
     ))
     for ma in ["MA5", "MA10", "MA20", "MA60"]:
-        fig.add_trace(go.Scatter(x=df.index, y=df[ma], mode="lines", name=ma, line=dict(width=1)))
-    fig.add_trace(go.Scatter(x=df.index, y=df["BB_UPPER"], mode="lines", name="BB上軌", line=dict(width=1, dash="dot")))
-    fig.add_trace(go.Scatter(x=df.index, y=df["BB_LOWER"], mode="lines", name="BB下軌", line=dict(width=1, dash="dot")))
+        if ma in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df[ma], mode="lines", name=ma, line=dict(width=1)))
+    if "BB_UPPER" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_UPPER"], mode="lines", name="BB上軌", line=dict(width=1, dash="dot")))
+    if "BB_LOWER" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_LOWER"], mode="lines", name="BB下軌", line=dict(width=1, dash="dot")))
     if tri.upper_line is not None and tri.lower_line is not None:
         u = tri.upper_line.tail(min(len(tri.upper_line), 150))
         l = tri.lower_line.tail(min(len(tri.lower_line), 150))
@@ -2039,6 +2048,80 @@ def summarize_backtest(trades: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+# -----------------------------
+# V8.2: robust scan diagnostics
+# -----------------------------
+def make_debug_result_row(ticker: str, name: str, industry: str, df_raw: pd.DataFrame, reason: str, market_label: str, style_mode: str) -> Dict:
+    """Return a display-safe row even when the stock is not a valid candidate.
+    This prevents a confusing '0 candidates' during deployment/data testing.
+    """
+    df0 = clean_yf_df(df_raw) if df_raw is not None else pd.DataFrame()
+    if not df0.empty:
+        try:
+            df_plot = add_indicators(df0).copy()
+            if df_plot.empty:
+                df_plot = df0.copy()
+        except Exception:
+            df_plot = df0.copy()
+        last = df0.iloc[-1]
+        price = safe_float(last.get("Close", np.nan))
+        latest = df0.index[-1].strftime("%Y-%m-%d") if hasattr(df0.index[-1], "strftime") else str(df0.index[-1])
+        days = len(df0)
+        data_status = "可讀取"
+    else:
+        df_plot = pd.DataFrame()
+        price = np.nan
+        latest = "-"
+        days = 0
+        data_status = "無資料"
+
+    code = pure_code(ticker)
+    return {
+        "代號": code,
+        "名稱": name or code,
+        "產業": industry or "未分類",
+        "Ticker": ticker,
+        "大盤": market_label,
+        "日期": latest,
+        "資料狀態": data_status,
+        "資料天數": days,
+        "最新資料日": latest,
+        "資料警示": reason,
+        "收盤": round(price, 2) if np.isfinite(price) else np.nan,
+        "評分": 0,
+        "等級": "DEBUG",
+        "動作": "除錯：未列入候選",
+        "操作模式": style_mode,
+        "型態": "未形成有效三角" if not df0.empty else "資料不足/抓取失敗",
+        "型態品質": "除錯",
+        "型態品質分": 0,
+        "風報比": np.nan,
+        "風險%": np.nan,
+        "潛在報酬%": np.nan,
+        "風報判斷": "-",
+        "偏好型態": "-",
+        "左側分": 0,
+        "右側分": 0,
+        "成熟度": "-",
+        "上線": np.nan,
+        "下線": np.nan,
+        "距上線%": np.nan,
+        "距下線%": np.nan,
+        "觸線": "上0/下0",
+        "20日均量(張)": np.nan,
+        "量比": np.nan,
+        "標籤": "除錯模式、非候選",
+        "理由": "資料可讀取，但目前沒有通過三角核心條件；正式模式會隱藏此列。" if not df0.empty else "資料抓取失敗或資料不足。",
+        "警示": reason,
+        "_df": df_plot,
+        "_tri": TriangleResult(False, "未形成有效三角", 0, None, None, None, None, None, None, None, None, 0, 0, "-", [], [], [reason]),
+        "_key_levels": {"upper": np.nan, "lower": np.nan, "red_half": np.nan, "red_half_date": "", "ma60": np.nan, "bb_upper": np.nan},
+        "_flags": {},
+        "_v7": {"quality_profile": {"label":"除錯", "score":0}, "risk_reward": {}, "side_profile": {"left":0,"right":0,"preferred":"-"}},
+        "_debug_only": True,
+    }
+
 # -----------------------------
 # Scanner utility
 # -----------------------------
@@ -2072,6 +2155,14 @@ def scan_rows(rows: pd.DataFrame, period: str, lookback: int, tol: float, tail_w
         )
         if res is not None and res["評分"] >= min_score:
             results.append(res)
+        elif debug_show_all:
+            if df is None or df.empty:
+                reason = "除錯：資料抓取失敗，請到資料健檢確認資料源或股票代號。"
+            elif len(df) < max(lookback, 90):
+                reason = f"除錯：資料天數不足，目前 {len(df)} 天，至少需要 {max(lookback, 90)} 天。"
+            else:
+                reason = "除錯：資料可讀取，但 evaluate_stock 回傳 None，通常代表未形成有效三角或早期試單訊號。"
+            results.append(make_debug_result_row(ticker, name, industry, df, reason, market_label, style_mode))
         progress.progress((i + 1) / max(1, len(rows)))
         time.sleep(0.02)
     status.success(f"掃描完成：找到 {len(results)} 檔候選。")
@@ -2555,9 +2646,9 @@ tail_width_limit = st.sidebar.slider("收斂尾端寬度上限", 0.06, 0.25, 0.1
 avg_lot_limit = st.sidebar.number_input("小資本股20日均量上限（張）", min_value=500, max_value=100000, value=10000, step=500)
 min_score = st.sidebar.slider("最低顯示評分", 0, 100, 58, 1)
 debug_show_all = st.sidebar.checkbox(
-    "除錯模式：顯示未達三角條件股票",
-    value=False,
-    help="測試資料源或新部署時可開啟。開啟後會列出資料抓得到但未形成三角候選的股票，方便判斷是資料問題還是條件問題。正式選股請關閉。",
+    "V8.2 除錯模式：顯示全部掃描股票與排除原因",
+    value=True,
+    help="新部署測試時建議先開啟。開啟後就算沒有形成三角候選，也會列出資料可讀取的股票與排除原因；正式選股可關閉。",
 )
 max_scan = st.sidebar.slider("本次最多掃描檔數", 10, 800, 100, 10)
 
