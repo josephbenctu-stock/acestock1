@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ACE Triangle Strategy Stock Screener V8
+ACE Triangle Strategy Stock Screener V8.3
 A mobile-friendly Streamlit app that screens Taiwan stocks for triangle-contraction patterns.
 
 This program is an educational implementation of the rules described in the uploaded lecture.
@@ -54,7 +54,7 @@ REPORTS_DIR.mkdir(exist_ok=True)
 # Page / Mobile UI
 # -----------------------------
 st.set_page_config(
-    page_title="艾斯三角收斂選股器 V8",
+    page_title="艾斯三角收斂選股器 V8.3",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -582,54 +582,237 @@ def fetch_ohlcv(ticker: str, period: str = "18mo") -> pd.DataFrame:
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def load_tw_universe() -> pd.DataFrame:
-    """Fetch listed and OTC common-stock tickers from the TWSE ISIN page, including industry when available."""
-    rows: List[Tuple[str, str, str, str, str]] = []
-    modes = [
-        ("上市", ".TW", "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
-        ("上櫃", ".TWO", "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
-    ]
-    for market, suffix, url in modes:
-        try:
-            tables = pd.read_html(url, encoding="big5")
-            if not tables:
+    """Load TWSE/TPEx stock universe.
+
+    V8.3 fix: 全市場自動掃描不再靜默退回 5 檔示範股。
+    讀取順序：
+    1. TWSE/TPEx OpenAPI
+    2. TWSE ISIN 網頁
+    3. data/tw_universe_fallback.csv
+    4. 內建精簡備援清單
+
+    回傳表一定包含 source 欄位，讓 UI 可以顯示目前實際使用哪個清單。
+    """
+    rows: List[Tuple[str, str, str, str, str, str]] = []
+
+    def _clean_code(x) -> str:
+        m = re.search(r"(\d{4})", str(x))
+        return m.group(1) if m else ""
+
+    def _clean_name(x) -> str:
+        text = str(x).strip()
+        text = re.sub(r"^\d{4}\s+", "", text)
+        return text if text and text.lower() not in ["nan", "none"] else ""
+
+    def _append_from_df(df: pd.DataFrame, market: str, suffix: str, source: str) -> int:
+        nonlocal rows
+        if df is None or df.empty:
+            return 0
+        cols = list(df.columns)
+        code_candidates = [c for c in cols if any(k in str(c) for k in ["證券代號", "公司代號", "股票代號", "代號", "Code", "code"])]
+        name_candidates = [c for c in cols if any(k in str(c) for k in ["證券名稱", "公司名稱", "股票名稱", "名稱", "簡稱", "Name", "name"])]
+        industry_candidates = [c for c in cols if any(k in str(c) for k in ["產業", "industry", "Industry"])]
+
+        # Some ISIN tables combine code and name into the first column.
+        code_col = code_candidates[0] if code_candidates else cols[0]
+        name_col = name_candidates[0] if name_candidates else None
+        industry_col = industry_candidates[0] if industry_candidates else None
+        added = 0
+        for _, r in df.iterrows():
+            raw_code = str(r.get(code_col, ""))
+            # ISIN first column looks like "2330 台積電".
+            m = re.match(r"^(\d{4})\s+(.+)$", raw_code.strip())
+            if m:
+                code = m.group(1)
+                name = _clean_name(m.group(2))
+            else:
+                code = _clean_code(raw_code)
+                name = _clean_name(r.get(name_col, "")) if name_col else code
+            if not re.fullmatch(r"[1-9]\d{3}", code):
                 continue
-            df = tables[0].copy()
-            if df.shape[0] > 2:
-                maybe_header = df.iloc[0].astype(str).tolist()
-                if any("有價證券" in x or "代號" in x for x in maybe_header):
-                    df.columns = maybe_header
-                    df = df.iloc[1:].reset_index(drop=True)
-            first_col = df.columns[0]
-            industry_col = next((c for c in df.columns if "產業" in str(c)), None)
-            extracted = df[first_col].astype(str).str.extract(r"^(\d{4})\s+(.+)$")
-            for idx, row in df.iterrows():
-                text = str(row[first_col])
-                m = re.match(r"^(\d{4})\s+(.+)$", text)
-                if not m:
-                    continue
-                code, name = m.group(1).strip(), m.group(2).strip()
-                if not re.fullmatch(r"[1-9]\d{3}", code):
-                    continue
-                industry = "未分類"
-                if industry_col is not None:
-                    raw_ind = str(row.get(industry_col, "")).strip()
-                    if raw_ind and raw_ind.lower() not in ["nan", "none"]:
-                        industry = raw_ind
-                rows.append((code, name, market, industry, code + suffix))
-        except Exception:
-            continue
-    if not rows:
-        rows = [
-            ("2330", "台積電", "上市", "半導體業", "2330.TW"),
-            ("2317", "鴻海", "上市", "其他電子業", "2317.TW"),
-            ("2454", "聯發科", "上市", "半導體業", "2454.TW"),
-            ("2308", "台達電", "上市", "電子零組件業", "2308.TW"),
-            ("6488", "環球晶", "上櫃", "半導體業", "6488.TWO"),
+            # Keep common stocks; skip many warrants/CB-like rows when names are obviously not common stock.
+            if any(bad in name for bad in ["購", "售", "牛", "熊", "可轉債", "認購", "認售"]):
+                continue
+            industry = "未分類"
+            if industry_col is not None:
+                raw_ind = str(r.get(industry_col, "")).strip()
+                if raw_ind and raw_ind.lower() not in ["nan", "none"]:
+                    industry = raw_ind
+            rows.append((code, name or code, market, industry, code + suffix, source))
+            added += 1
+        return added
+
+    # 1) Official OpenAPI first. These endpoints are lightweight and more stable than HTML pages.
+    openapi_jobs = [
+        ("上市", ".TW", "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", "TWSE OpenAPI STOCK_DAY_ALL"),
+        ("上市", ".TW", "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_d", "TWSE OpenAPI BWIBBU_d"),
+        ("上櫃", ".TWO", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", "TPEx OpenAPI quotes"),
+        ("上櫃", ".TWO", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes", "TPEx OpenAPI daily close"),
+        ("上櫃", ".TWO", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", "TPEx OpenAPI peratio"),
+    ]
+    for market, suffix, url, source in openapi_jobs:
+        try:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                # Some APIs wrap rows in a nested list.
+                for key in ["data", "rows", "result"]:
+                    if isinstance(data.get(key), list):
+                        data = data[key]
+                        break
+            if isinstance(data, list) and data:
+                _append_from_df(pd.DataFrame(data), market, suffix, source)
+        except Exception as exc:
+            log_error("load_tw_universe_openapi", source, url, exc)
+
+    # 2) ISIN HTML fallback with explicit requests headers.
+    if len(rows) < 100:
+        modes = [
+            ("上市", ".TW", "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
+            ("上櫃", ".TWO", "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
         ]
-    out = pd.DataFrame(rows, columns=["code", "name", "market", "industry", "ticker"])
-    return out.drop_duplicates("ticker").sort_values(["market", "industry", "code"]).reset_index(drop=True)
+        for market, suffix, url in modes:
+            try:
+                resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+                # The page is Big5/CP950. Let pandas parse from text after decoding.
+                resp.encoding = "big5"
+                tables = pd.read_html(io.StringIO(resp.text))
+                for df in tables[:1]:
+                    if df.shape[0] > 2:
+                        maybe_header = df.iloc[0].astype(str).tolist()
+                        if any("有價證券" in x or "代號" in x for x in maybe_header):
+                            df.columns = maybe_header
+                            df = df.iloc[1:].reset_index(drop=True)
+                    _append_from_df(df, market, suffix, "TWSE ISIN HTML")
+            except Exception as exc:
+                log_error("load_tw_universe_isin", market, url, exc)
+
+    # 3) Bundled CSV fallback, if user later adds/updates it.
+    if len(rows) < 50:
+        fallback_csv = DATA_DIR / "tw_universe_fallback.csv"
+        if fallback_csv.exists():
+            try:
+                fdf = pd.read_csv(fallback_csv, dtype=str)
+                if {"code", "ticker"}.intersection(fdf.columns):
+                    for _, r in fdf.iterrows():
+                        code = _clean_code(r.get("code", r.get("ticker", "")))
+                        ticker = str(r.get("ticker", code + ".TW")).strip()
+                        market = str(r.get("market", "上市" if ticker.endswith(".TW") else "上櫃"))
+                        suffix = ".TWO" if ticker.endswith(".TWO") or market == "上櫃" else ".TW"
+                        rows.append((code, str(r.get("name", code)), market, str(r.get("industry", "未分類")), code + suffix, "本機 fallback CSV"))
+            except Exception as exc:
+                log_error("load_tw_universe_fallback_csv", str(fallback_csv), "", exc)
+
+    # 4) Last resort: broader built-in fallback, not just 5 sample stocks.
+    if len(rows) < 50:
+        built_in = """
+2330,台積電,上市,半導體業,.TW
+2317,鴻海,上市,其他電子業,.TW
+2454,聯發科,上市,半導體業,.TW
+2308,台達電,上市,電子零組件業,.TW
+2382,廣達,上市,電腦及週邊設備業,.TW
+2412,中華電,上市,通信網路業,.TW
+2881,富邦金,上市,金融保險業,.TW
+2882,國泰金,上市,金融保險業,.TW
+2303,聯電,上市,半導體業,.TW
+2891,中信金,上市,金融保險業,.TW
+3711,日月光投控,上市,半導體業,.TW
+2886,兆豐金,上市,金融保險業,.TW
+2357,華碩,上市,電腦及週邊設備業,.TW
+1216,統一,上市,食品工業,.TW
+1303,南亞,上市,塑膠工業,.TW
+1301,台塑,上市,塑膠工業,.TW
+2002,中鋼,上市,鋼鐵工業,.TW
+2603,長榮,上市,航運業,.TW
+2609,陽明,上市,航運業,.TW
+2615,萬海,上市,航運業,.TW
+2618,長榮航,上市,航運業,.TW
+2610,華航,上市,航運業,.TW
+2207,和泰車,上市,汽車工業,.TW
+2327,國巨,上市,電子零組件業,.TW
+2379,瑞昱,上市,半導體業,.TW
+3034,聯詠,上市,半導體業,.TW
+3045,台灣大,上市,通信網路業,.TW
+4904,遠傳,上市,通信網路業,.TW
+3008,大立光,上市,光電業,.TW
+5871,中租-KY,上市,其他業,.TW
+6669,緯穎,上市,電腦及週邊設備業,.TW
+3231,緯創,上市,電腦及週邊設備業,.TW
+2356,英業達,上市,電腦及週邊設備業,.TW
+2324,仁寶,上市,電腦及週邊設備業,.TW
+4938,和碩,上市,電腦及週邊設備業,.TW
+3017,奇鋐,上市,電腦及週邊設備業,.TW
+6239,力成,上市,半導體業,.TW
+2408,南亞科,上市,半導體業,.TW
+2376,技嘉,上市,電腦及週邊設備業,.TW
+2409,友達,上市,光電業,.TW
+3481,群創,上市,光電業,.TW
+2345,智邦,上市,通信網路業,.TW
+3533,嘉澤,上市,電子零組件業,.TW
+3653,健策,上市,電子零組件業,.TW
+3661,世芯-KY,上市,半導體業,.TW
+3443,創意,上市,半導體業,.TW
+3037,欣興,上市,電子零組件業,.TW
+8046,南電,上市,電子零組件業,.TW
+3189,景碩,上市,電子零組件業,.TW
+2337,旺宏,上市,半導體業,.TW
+2344,華邦電,上市,半導體業,.TW
+6488,環球晶,上櫃,半導體業,.TWO
+5347,世界,上櫃,半導體業,.TWO
+3105,穩懋,上櫃,半導體業,.TWO
+4966,譜瑞-KY,上櫃,半導體業,.TWO
+3264,欣銓,上櫃,半導體業,.TWO
+8299,群聯,上櫃,半導體業,.TWO
+6187,萬潤,上櫃,其他電子業,.TWO
+6223,旺矽,上櫃,半導體業,.TWO
+6510,精測,上櫃,半導體業,.TWO
+6121,新普,上櫃,電腦及週邊設備業,.TWO
+6147,頎邦,上櫃,半導體業,.TWO
+8069,元太,上櫃,光電業,.TWO
+3081,聯亞,上櫃,通信網路業,.TWO
+5274,信驊,上櫃,電腦及週邊設備業,.TWO
+6182,合晶,上櫃,半導體業,.TWO
+5483,中美晶,上櫃,半導體業,.TWO
+6548,長科*,上櫃,半導體業,.TWO
+3324,雙鴻,上市,電腦及週邊設備業,.TW
+5439,高技,上櫃,電子零組件業,.TWO
+3491,昇達科,上櫃,通信網路業,.TWO
+6274,台燿,上櫃,電子零組件業,.TWO
+4958,臻鼎-KY,上市,電子零組件業,.TW
+2383,台光電,上市,電子零組件業,.TW
+8112,至上,上市,電子通路業,.TW
+1560,中砂,上市,電機機械,.TW
+5536,聖暉*,上櫃,其他電子業,.TWO
+6805,富世達,上市,電子零組件業,.TW
+8996,高力,上市,電機機械,.TW
+5876,上海商銀,上市,金融保險業,.TW
+2884,玉山金,上市,金融保險業,.TW
+2885,元大金,上市,金融保險業,.TW
+2892,第一金,上市,金融保險業,.TW
+5880,合庫金,上市,金融保險業,.TW
+2880,華南金,上市,金融保險業,.TW
+2883,開發金,上市,金融保險業,.TW
+2890,永豐金,上市,金融保險業,.TW
+2887,台新金,上市,金融保險業,.TW
+1402,遠東新,上市,紡織纖維,.TW
+2912,統一超,上市,貿易百貨,.TW
+1101,台泥,上市,水泥工業,.TW
+1102,亞泥,上市,水泥工業,.TW
+""".strip().splitlines()
+        for line in built_in:
+            code, name, market, industry, suffix = [x.strip() for x in line.split(",")]
+            rows.append((code, name, market, industry, code + suffix, "內建精簡備援清單"))
+
+    out = pd.DataFrame(rows, columns=["code", "name", "market", "industry", "ticker", "source"])
+    out = out[out["code"].astype(str).str.fullmatch(r"[1-9]\d{3}", na=False)].copy()
+    out = out.drop_duplicates("ticker").sort_values(["market", "industry", "code"]).reset_index(drop=True)
+    if out.empty:
+        out = pd.DataFrame(columns=["code", "name", "market", "industry", "ticker", "source"])
+    return out
 
 
 def parse_chip_csv(uploaded_file) -> pd.DataFrame:
@@ -2607,7 +2790,7 @@ def generate_strategy_report(results: List[Dict], market_ctx: Optional[Dict] = N
 # -----------------------------
 # App layout
 # -----------------------------
-st.title("📈 艾斯三角收斂選股器 V8")
+st.title("📈 艾斯三角收斂選股器 V8.3")
 st.caption("手機友善版｜V8 新增：官方資料補強、每日報告推播、參數優化建議；保留V7模組化、紙上交易、風險報酬比與測試工具。")
 
 with st.expander("V8 累積強化內容", expanded=False):
@@ -2646,9 +2829,9 @@ tail_width_limit = st.sidebar.slider("收斂尾端寬度上限", 0.06, 0.25, 0.1
 avg_lot_limit = st.sidebar.number_input("小資本股20日均量上限（張）", min_value=500, max_value=100000, value=10000, step=500)
 min_score = st.sidebar.slider("最低顯示評分", 0, 100, 58, 1)
 debug_show_all = st.sidebar.checkbox(
-    "V8.2 除錯模式：顯示全部掃描股票與排除原因",
+    "V8.3 除錯模式：顯示全部掃描股票與排除原因",
     value=True,
-    help="新部署測試時建議先開啟。開啟後就算沒有形成三角候選，也會列出資料可讀取的股票與排除原因；正式選股可關閉。",
+    help="新部署測試時建議先開啟。開啟後就算沒有形成三角候選，也會列出資料可讀取的股票與排除原因；正式選股可關閉。V8.3 已修正全市場掃描不應只退回手動預設 5 檔的問題。",
 )
 max_scan = st.sidebar.slider("本次最多掃描檔數", 10, 800, 100, 10)
 
@@ -2699,13 +2882,25 @@ with scanner_tab:
         tickers_df = make_tickers_from_text(codes_text, suffix)
     else:
         universe = load_tw_universe()
-        markets = st.multiselect("市場", ["上市", "上櫃"], default=["上市", "上櫃"])
-        keyword = st.text_input("名稱／代號篩選（可留空）", value="")
-        tickers_df = universe[universe["market"].isin(markets)].copy()
-        if keyword.strip():
-            kw = keyword.strip()
-            tickers_df = tickers_df[tickers_df["code"].str.contains(kw) | tickers_df["name"].str.contains(kw, na=False)]
-        st.write(f"可掃描清單：{len(tickers_df):,} 檔；本次上限 {max_scan:,} 檔。")
+        if universe.empty:
+            st.error("全市場清單讀取失敗：目前無可掃描股票。請先改用手動輸入，或到資料健檢查看 error_log。")
+            tickers_df = universe
+        else:
+            source_msg = "、".join([f"{src} {cnt}檔" for src, cnt in universe["source"].value_counts().items()]) if "source" in universe.columns else "未標示來源"
+            st.caption(f"全市場清單來源：{source_msg}")
+            if len(universe) <= 10:
+                st.warning("目前全市場清單只有少數股票，通常代表官方清單讀取失敗；V8.3 已避免靜默只掃預設 5 檔，請確認來源提示。")
+            elif "source" in universe.columns and universe["source"].astype(str).str.contains("內建精簡備援").any():
+                st.warning("官方全市場清單讀取失敗，目前使用內建精簡備援清單；可以先測試功能，但不代表完整全市場。")
+            markets = st.multiselect("市場", ["上市", "上櫃"], default=["上市", "上櫃"])
+            keyword = st.text_input("名稱／代號篩選（可留空）", value="")
+            tickers_df = universe[universe["market"].isin(markets)].copy()
+            if keyword.strip():
+                kw = keyword.strip()
+                tickers_df = tickers_df[tickers_df["code"].str.contains(kw) | tickers_df["name"].str.contains(kw, na=False)]
+            st.write(f"可掃描清單：{len(tickers_df):,} 檔；本次上限 {max_scan:,} 檔。")
+            with st.expander("查看本次全市場清單前 30 檔", expanded=False):
+                st.dataframe(tickers_df.head(30), use_container_width=True, hide_index=True)
 
     start_scan = st.button("🚀 開始掃描", type="primary", use_container_width=True)
     if start_scan:
