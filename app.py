@@ -2833,7 +2833,7 @@ debug_show_all = st.sidebar.checkbox(
     value=True,
     help="新部署測試時建議先開啟。開啟後就算沒有形成三角候選，也會列出資料可讀取的股票與排除原因；正式選股可關閉。V8.3 已修正全市場掃描不應只退回手動預設 5 檔的問題。",
 )
-max_scan = st.sidebar.slider("本次最多掃描檔數", 10, 800, 100, 10)
+max_scan = st.sidebar.slider("本次最多掃描檔數", 10, 2500, 800, 10)
 
 st.sidebar.header("籌碼資料（選填）")
 chip_file = st.sidebar.file_uploader("上傳買賣家數差 CSV", type=["csv"])
@@ -2941,7 +2941,7 @@ with scanner_tab:
         q4.metric("右側分", r.get("右側分", "-"))
         tags_html = "".join([f"<span class='pill'>{t}</span>" for t in str(r["標籤"]).split("、") if t])
         st.markdown(f"<div class='signal-card'><b>標籤：</b><br>{tags_html}<br><b>理由：</b>{r['理由']}<br><b>警示：</b>{r['警示']}</div>", unsafe_allow_html=True)
-        st.plotly_chart(plot_stock(r), use_container_width=True)
+        st.plotly_chart(plot_stock(r), use_container_width=True, key=f"scan_chart_{r.get('代號', '')}_{idx}_{r.get('日期', '')}")
 
 
 with market_tab:
@@ -3005,7 +3005,7 @@ with plan_tab:
         m4.metric("風險股數上限", f"{plan_df.attrs['risk_shares']:,}" if pd.notna(plan_df.attrs['risk_shares']) else "-")
         st.dataframe(plan_df, use_container_width=True, hide_index=True)
         st.markdown(f"<div class='signal-card'><b>目前判讀：</b>{r.get('動作')}｜{r.get('等級')}｜評分 {r.get('評分')}<br><b>標籤：</b>{r.get('標籤')}<br><b>警示：</b>{r.get('警示')}</div>", unsafe_allow_html=True)
-        st.plotly_chart(plot_stock(r), use_container_width=True)
+        st.plotly_chart(plot_stock(r), use_container_width=True, key=f"plan_chart_{r.get('代號', '')}_{r.get('日期', '')}")
         st.download_button("下載交易計畫 CSV", plan_df.to_csv(index=False).encode("utf-8-sig"), file_name=f"ace_trade_plan_{r['代號']}_{datetime.now():%Y%m%d_%H%M}.csv", mime="text/csv")
 
 
@@ -3208,7 +3208,7 @@ with holdings_tab:
                 chosen = st.selectbox("查看持股圖表", options, key="holding_chart_select")
                 r = full_results[options.index(chosen)]
                 if "_df" in r and "_tri" in r:
-                    st.plotly_chart(plot_stock(r), use_container_width=True)
+                    st.plotly_chart(plot_stock(r), use_container_width=True, key=f"holding_chart_{r.get('代號', '')}_{options.index(chosen)}")
 
 with capital_tab:
     st.subheader("資金控管計算器")
